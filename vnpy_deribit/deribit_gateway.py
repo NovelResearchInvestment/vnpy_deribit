@@ -1,10 +1,10 @@
 from datetime import datetime
 from copy import copy
 from typing import Callable, Dict, Set
-from pytz import timezone
 
 from tzlocal import get_localzone
 
+from vnpy.event import Event, EventEngine
 from vnpy.trader.object import (
     TickData,
     OrderData,
@@ -27,12 +27,12 @@ from vnpy.trader.constant import (
 )
 from vnpy.trader.event import EVENT_TIMER
 from vnpy.trader.gateway import BaseGateway
-from vnpy.event.engine import Event, EventEngine
+from vnpy.trader.utility import ZoneInfo
 from vnpy_websocket import WebsocketClient
 
 
 # 本地时区
-LOCAL_TZ: timezone = get_localzone()
+LOCAL_TZ: ZoneInfo = get_localzone()
 
 # 实盘和模拟盘Websocket API地址
 REAL_WEBSOCKET_HOST: str = "wss://www.deribit.com/ws/api/v2"
@@ -63,8 +63,12 @@ DIRECTION_DERIBIT2VT: Dict[str, Direction] = {v: k for k, v in DIRECTION_VT2DERI
 
 # 产品类型映射
 PRODUCT_DERIBIT2VT: Dict[str, Product] = {
+    "spot": Product.SPOT,
     "future": Product.FUTURES,
-    "option": Product.OPTION
+    "future_combo": Product.FUTURES,
+    "option": Product.OPTION,
+    "strike": Product.OPTION,
+    "option_combo": Product.OPTION
 }
 
 # 期权类型映射
@@ -78,6 +82,8 @@ class DeribitGateway(BaseGateway):
     """
     vn.py用于对接Deribit交易所的交易接口。
     """
+
+    default_name = "DERIBIT"
 
     default_setting = {
         "key": "",
@@ -325,7 +331,7 @@ class DeribitWebsocketApi(WebsocketClient):
 
     def query_account(self) -> None:
         """查询资金"""
-        for currency in ["BTC", "ETH"]:
+        for currency in ["BTC", "ETH", "USDC"]:
             params: dict = {"currency": currency}
 
             self.send_request(
@@ -465,10 +471,12 @@ class DeribitWebsocketApi(WebsocketClient):
                 ])
 
                 contract.option_portfolio = d["base_currency"]
-                contract.option_strike = d["strike"]
-                contract.option_index = str(d["strike"])
+                if "strike" in d:
+                    contract.option_strike = d["strike"]
+                    contract.option_index = str(d["strike"])
                 contract.option_underlying = option_underlying
-                contract.option_type = OPTIONTYPE_DERIBIT2VT[d["option_type"]]
+                if "option_type" in d:
+                    contract.option_type = OPTIONTYPE_DERIBIT2VT[d["option_type"]]
                 contract.option_expiry = option_expiry
 
             self.gateway.on_contract(contract)
@@ -493,7 +501,7 @@ class DeribitWebsocketApi(WebsocketClient):
                 exchange=Exchange.DERIBIT,
                 direction=Direction.NET,
                 volume=pos["size"],
-                pnl=pos["floating_profit_loss"],
+                pnl=pos["total_profit_loss"],
                 gateway_name=self.gateway_name,
             )
             self.gateway.on_position(position)
@@ -607,7 +615,7 @@ class DeribitWebsocketApi(WebsocketClient):
     def on_trade(self, data: dict) -> None:
         """成交更新推送"""
         sys_id: str = data["order_id"]
-        local_id: str = self.sys_local_map[sys_id]
+        local_id: str = sys_id
 
         trade: TradeData = TradeData(
             symbol=data["instrument_name"],
@@ -648,9 +656,20 @@ class DeribitWebsocketApi(WebsocketClient):
         tick.high_price = get_float(data["stats"]["high"])
         tick.low_price = get_float(data["stats"]["low"])
         tick.volume = get_float(data["stats"]["volume"])
-        tick.open_interest = get_float(data["open_interest"])
+        tick.open_interest = get_float(data.get("open_interest", 0))
         tick.datetime = generate_datetime(data["timestamp"])
         tick.localtime = datetime.now()
+
+        if 'mark_iv' in data:
+            tick.extra = {
+                "implied_volatility": get_float(data["mark_iv"]),
+                "und_price": get_float(data["underlying_price"]),
+                "option_price": get_float(data["mark_price"]),
+                "delta": get_float(data["greeks"]["delta"]),
+                "gamma": get_float(data["greeks"]["gamma"]),
+                "vega": get_float(data["greeks"]["vega"]),
+                "theta": get_float(data["greeks"]["theta"]),
+            }
 
         if tick.last_price:
             self.gateway.on_tick(copy(tick))
@@ -711,7 +730,7 @@ class DeribitWebsocketApi(WebsocketClient):
 def generate_datetime(timestamp: int) -> datetime:
     """生成时间戳"""
     dt: datetime = datetime.fromtimestamp(timestamp / 1000)
-    return LOCAL_TZ.localize(dt)
+    return dt.replace(tzinfo=LOCAL_TZ)
 
 
 def get_float(value: any) -> float:
